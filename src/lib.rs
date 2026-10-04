@@ -40,6 +40,7 @@ mod references;
 mod serde;
 #[cfg(feature = "specialization")]
 mod specialization;
+pub mod transaction;
 
 #[cfg(feature = "bytes")]
 use bytes::{
