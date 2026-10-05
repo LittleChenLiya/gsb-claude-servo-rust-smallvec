@@ -52,7 +52,10 @@ use defmt::{
     Formatter as DeFormatter,
     write as dewrite
 };
-pub use errors::SmallVecError;
+pub use errors::{
+    MapInPlaceError,
+    SmallVecError
+};
 #[cfg(feature = "std")]
 use std::io;
 use {
@@ -1117,6 +1120,157 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         // SAFETY: `write` is always less than or equal to original_len.
         unsafe { g.v.set_len(g.write) };
         core::mem::forget(g);
+    }
+
+    /// Consumes the vector and applies a fallible mapping function to each
+    /// element, reusing the vector's original buffer.
+    ///
+    /// The mapper receives ownership of each element `T` and returns either:
+    /// - `Ok(new)` — the new value that replaces the element in place, or
+    /// - `Err((recovered, error))` — a recovered value that is written back
+    ///   into the element's slot, together with an error.
+    ///
+    /// No [`Clone`] bound is required: the mapper takes `T` by value and
+    /// returns `T` by value. The vector's original buffer is reused for the
+    /// entire operation; no reallocation takes place, so a spilled vector
+    /// keeps the same heap pointer.
+    ///
+    /// # Ownership
+    ///
+    /// - On success, `Ok(())` is returned and the vector is consumed. Every
+    ///   element has been replaced by a new value.
+    /// - On error, `Err(MapInPlaceError)` is returned, carrying:
+    ///   - `vec`: the partially converted vector. Elements `0..index` are the
+    ///     new values produced by the mapper. Element `index` is the recovered
+    ///     value returned by the mapper (it is whatever the mapper provides; it
+    ///     is **not** assumed to be identical to the original element).
+    ///     Elements `index + 1..` are the original, untouched values. The
+    ///     vector's original buffer is reused.
+    ///   - `index`: the index of the element for which the mapper returned an
+    ///     error.
+    ///   - `error`: the error returned by the mapper.
+    ///
+    /// This is **not** a whole-batch rollback: the successfully converted
+    /// prefix is kept, and the failed slot is filled with the recovered value.
+    ///
+    /// # Panics
+    ///
+    /// If the mapper panics while processing element `i`, a drop guard
+    /// ensures that:
+    /// - the converted prefix `0..i` is dropped exactly once,
+    /// - the untouched suffix `i + 1..` is dropped exactly once,
+    /// - the element at index `i` is **not** dropped by the guard (it is owned
+    ///   by the mapper and dropped by its unwinding, or leaked),
+    /// - there are no uninitialized slots and no double drops.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smallvec::SmallVec;
+    ///
+    /// let v: SmallVec<i32, 4> = SmallVec::from(&[1, 2, 3, 4, 5][..]);
+    /// let result = v.map_in_place(|x| {
+    ///     if x == 3 {
+    ///         Err((x * 10, "three is unlucky"))
+    ///     } else {
+    ///         Ok(x * 2)
+    ///     }
+    /// });
+    /// let err = result.unwrap_err();
+    /// assert_eq!(err.index, 2);
+    /// assert_eq!(err.error, "three is unlucky");
+    /// // The first two elements are new values, the third is the recovered
+    /// // value, and the rest are the original values.
+    /// assert_eq!(&*err.vec, &[2, 4, 30, 4, 5]);
+    /// ```
+    pub fn map_in_place<F, E>(mut self, mut f: F) -> Result<(), MapInPlaceError<T, N, A, E>>
+    where F: FnMut(T) -> Result<T, (T, E)> {
+        let len = self.len();
+
+        // A drop guard that, on panic, drops the converted prefix and the
+        // untouched suffix of the vector. The element at the index being
+        // processed when the panic occurred is owned by `f` and is dropped
+        // (or leaked) by `f`'s unwinding; we must not touch it here.
+        struct Guard<'a, T, const N: usize, A: Allocator> {
+            vec: &'a mut SmallVec<T, N, A>,
+            /// The index currently being processed. On panic, `0..index` are
+            /// converted new values and `index + 1..len` are original values.
+            index: usize,
+            len: usize
+        }
+
+        impl<T, const N: usize, A: Allocator> Drop for Guard<'_, T, N, A> {
+            fn drop(&mut self) {
+                // SAFETY: We set the length to zero so the `SmallVec`'s own
+                // `Drop` impl does not drop the elements (we drop them
+                // ourselves below). The on-heap tag is preserved, so the
+                // allocation is still deallocated correctly.
+                unsafe { self.vec.set_len(0) };
+
+                // SAFETY: `0..self.index` are initialized new values.
+                unsafe {
+                    core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                        self.vec.as_mut_ptr(),
+                        self.index
+                    ));
+                }
+                // SAFETY: `self.index + 1..self.len` are initialized original
+                // values.
+                unsafe {
+                    core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                        self.vec.as_mut_ptr().add(self.index + 1),
+                        self.len - self.index - 1
+                    ));
+                }
+            }
+        }
+
+        let mut guard = Guard {
+            vec: &mut self,
+            index: 0,
+            len
+        };
+
+        for i in 0..len {
+            // Update the guard to reflect the state while `f` runs:
+            // - `0..i` are converted new values,
+            // - slot `i` is uninitialized (the element has been read out),
+            // - `i + 1..len` are untouched original values.
+            guard.index = i;
+
+            // SAFETY: `i < len`, so the slot is initialized. We take ownership
+            // of the element; the slot becomes uninitialized until we write a
+            // replacement.
+            let elem = unsafe { guard.vec.as_mut_ptr().add(i).read() };
+
+            match f(elem) {
+                Ok(new) => {
+                    // SAFETY: the slot at `i` is uninitialized (we just read
+                    // the element out), and `new` is a valid `T`.
+                    unsafe { guard.vec.as_mut_ptr().add(i).write(new) };
+                    // Now `0..=i` are new values. The next iteration updates
+                    // the guard before reading the next element.
+                }
+                Err((recovered, error)) => {
+                    // SAFETY: the slot at `i` is uninitialized; write the
+                    // recovered value back so the vector is fully initialized.
+                    unsafe { guard.vec.as_mut_ptr().add(i).write(recovered) };
+                    // Disarm the guard: no panic occurred, and we are returning
+                    // the (partially converted) vector to the caller.
+                    core::mem::forget(guard);
+                    return Err(MapInPlaceError {
+                        vec: self,
+                        index: i,
+                        error
+                    });
+                }
+            }
+        }
+
+        // All elements converted successfully. Disarm the guard; `self` is
+        // dropped normally (all elements are new values).
+        core::mem::forget(guard);
+        Ok(())
     }
 
     #[inline]

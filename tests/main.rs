@@ -1143,3 +1143,317 @@ fn spare_capacity_mut() {
     assert!(!spare.is_empty());
     assert_eq!(spare.as_ptr().cast::<u8>(), unsafe { v.as_ptr().add(3) });
 }
+
+// ---------------------------------------------------------------------------
+// map_in_place
+// ---------------------------------------------------------------------------
+
+/// A value that counts how many times it has been dropped.
+struct DropCounter<'a> {
+    counter: &'a Cell<usize>,
+    id: usize
+}
+
+impl<'a> Drop for DropCounter<'a> {
+    fn drop(&mut self) {
+        self.counter.set(self.counter.get() + 1);
+    }
+}
+
+#[test]
+fn map_in_place_success_inline() {
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 4> = SmallVec::new();
+    for id in 0..3 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(!v.spilled());
+
+    let result = v.map_in_place(|x| {
+        Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+            counter: &cell,
+            id: x.id + 100
+        })
+    });
+    assert!(result.is_ok());
+
+    // The vector was consumed and dropped normally. Each old element was
+    // dropped in the closure (when `x` went out of scope), and each new
+    // element was dropped when the vector dropped: 2 * 3 = 6.
+    assert_eq!(cell.get(), 6);
+}
+
+#[test]
+fn map_in_place_success_spilled() {
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 2> = SmallVec::new();
+    for id in 0..5 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(v.spilled());
+
+    let result = v.map_in_place(|x| {
+        Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+            counter: &cell,
+            id: x.id + 100
+        })
+    });
+    assert!(result.is_ok());
+    // 5 old elements dropped in the closure + 5 new elements dropped when the
+    // vector dropped.
+    assert_eq!(cell.get(), 10);
+}
+
+#[test]
+fn map_in_place_error_inline_third_fails() {
+    let v: SmallVec<i32, 5> = SmallVec::from(&[1, 2, 3, 4, 5][..]);
+    assert!(!v.spilled());
+
+    let result = v.map_in_place(|x| {
+        if x == 3 {
+            // The recovered value is NOT the original; it is whatever the
+            // mapper provides.
+            Err((30, "three is unlucky"))
+        } else {
+            Ok(x * 2)
+        }
+    });
+
+    let err = result.unwrap_err();
+    assert_eq!(err.index, 2);
+    assert_eq!(err.error, "three is unlucky");
+    // First two are new values, third is the recovered value, rest are
+    // original values.
+    assert_eq!(&*err.vec, &[2, 4, 30, 4, 5]);
+    assert!(!err.vec.spilled());
+}
+
+#[test]
+fn map_in_place_error_spilled_third_fails() {
+    let v: SmallVec<i32, 2> = SmallVec::from(&[1, 2, 3, 4, 5][..]);
+    assert!(v.spilled());
+    let ptr_before = v.as_ptr();
+
+    let result = v.map_in_place(|x| {
+        if x == 3 {
+            Err((30, "three is unlucky"))
+        } else {
+            Ok(x * 2)
+        }
+    });
+
+    let err = result.unwrap_err();
+    assert_eq!(err.index, 2);
+    assert_eq!(err.error, "three is unlucky");
+    assert_eq!(&*err.vec, &[2, 4, 30, 4, 5]);
+    assert!(err.vec.spilled());
+    // The original buffer must be reused: same heap pointer.
+    assert_eq!(err.vec.as_ptr(), ptr_before);
+}
+
+#[test]
+fn map_in_place_error_n0() {
+    // SmallVec<T, 0> is always spilled.
+    let v: SmallVec<i32, 0> = SmallVec::from(&[1, 2, 3][..]);
+    assert!(v.spilled());
+    let ptr_before = v.as_ptr();
+
+    let result = v.map_in_place(|x| if x == 2 { Err((20, "bad")) } else { Ok(x * 10) });
+
+    let err = result.unwrap_err();
+    assert_eq!(err.index, 1);
+    assert_eq!(err.error, "bad");
+    assert_eq!(&*err.vec, &[10, 20, 3]);
+    assert_eq!(err.vec.as_ptr(), ptr_before);
+}
+
+#[test]
+fn map_in_place_panic_drop_count_inline() {
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 4> = SmallVec::new();
+    for id in 0..3 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(!v.spilled());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.map_in_place(|x| {
+            if x.id == 2 {
+                panic!("boom");
+            }
+            Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+                counter: &cell,
+                id: x.id + 100
+            })
+        })
+    }));
+
+    assert!(result.is_err());
+    // Each converted element's old value was dropped in the closure (2),
+    // the panic element was dropped by the mapper's unwinding (1), and the
+    // guard dropped the new prefix (2). The suffix is empty.
+    // Total: 2 + 1 + 2 = 5.
+    assert_eq!(cell.get(), 5);
+}
+
+#[test]
+fn map_in_place_panic_drop_count_spilled() {
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 2> = SmallVec::new();
+    for id in 0..5 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(v.spilled());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.map_in_place(|x| {
+            if x.id == 2 {
+                panic!("boom");
+            }
+            Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+                counter: &cell,
+                id: x.id + 100
+            })
+        })
+    }));
+
+    assert!(result.is_err());
+    // Each converted element's old value was dropped in the closure (2),
+    // the panic element was dropped by the mapper's unwinding (1), the guard
+    // dropped the new prefix (2) and the original suffix (2).
+    // Total: 2 + 1 + 2 + 2 = 7.
+    assert_eq!(cell.get(), 7);
+}
+
+#[test]
+fn map_in_place_panic_drop_count_n0() {
+    // SmallVec<T, 0> is always spilled.
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 0> = SmallVec::new();
+    for id in 0..4 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(v.spilled());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.map_in_place(|x| {
+            if x.id == 1 {
+                panic!("boom");
+            }
+            Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+                counter: &cell,
+                id: x.id + 100
+            })
+        })
+    }));
+
+    assert!(result.is_err());
+    // The converted element's old value was dropped in the closure (1), the
+    // panic element was dropped by the mapper's unwinding (1), the guard
+    // dropped the new prefix (1) and the original suffix (2).
+    // Total: 1 + 1 + 1 + 2 = 5.
+    assert_eq!(cell.get(), 5);
+}
+
+#[test]
+fn map_in_place_panic_first_element() {
+    // Panic on the very first element: prefix is empty, suffix is all
+    // remaining elements.
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 4> = SmallVec::new();
+    for id in 0..4 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(!v.spilled());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.map_in_place(|x| {
+            if x.id == 0 {
+                panic!("boom");
+            }
+            Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+                counter: &cell,
+                id: x.id + 100
+            })
+        })
+    }));
+
+    assert!(result.is_err());
+    // The panic element was dropped by the mapper's unwinding (1), and the
+    // guard dropped the original suffix (3). The prefix is empty.
+    // Total: 1 + 3 = 4.
+    assert_eq!(cell.get(), 4);
+}
+
+#[test]
+fn map_in_place_panic_last_element() {
+    // Panic on the very last element: prefix is all previous elements,
+    // suffix is empty.
+    let cell = Cell::new(0);
+    let mut v: SmallVec<DropCounter<'_>, 4> = SmallVec::new();
+    for id in 0..4 {
+        v.push(DropCounter {
+            counter: &cell,
+            id
+        });
+    }
+    assert!(!v.spilled());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.map_in_place(|x| {
+            if x.id == 3 {
+                panic!("boom");
+            }
+            Ok::<DropCounter<'_>, (DropCounter<'_>, ())>(DropCounter {
+                counter: &cell,
+                id: x.id + 100
+            })
+        })
+    }));
+
+    assert!(result.is_err());
+    // Each converted element's old value was dropped in the closure (3), the
+    // panic element was dropped by the mapper's unwinding (1), and the guard
+    // dropped the new prefix (3). The suffix is empty.
+    // Total: 3 + 1 + 3 = 7.
+    assert_eq!(cell.get(), 7);
+}
+
+#[test]
+fn map_in_place_zst() {
+    // ZSTs never spill; the method must still work for both success and
+    // error paths.
+    let v: SmallVec<(), 4> = SmallVec::from(&[(), (), ()][..]);
+    assert!(!v.spilled());
+
+    let result = v.map_in_place(|x| if x == () { Err(((), "bad")) } else { Ok(()) });
+    let err = result.unwrap_err();
+    assert_eq!(err.index, 0);
+    assert_eq!(err.error, "bad");
+    assert_eq!(err.vec.len(), 3);
+}
+
+#[test]
+fn map_in_place_empty() {
+    let v: SmallVec<i32, 4> = SmallVec::new();
+    let result = v.map_in_place(|x| Ok::<i32, (i32, ())>(x + 1));
+    assert!(result.is_ok());
+}
