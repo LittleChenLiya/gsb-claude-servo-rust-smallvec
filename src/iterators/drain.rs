@@ -171,13 +171,20 @@ impl<T, const N: usize, A: Allocator> Drain<'_, T, N, A> {
 
     /// Makes room for inserting more elements before the tail.
     #[track_caller]
-    pub(crate) unsafe fn move_tail(&mut self, additional: usize) {
+    pub(crate) unsafe fn move_tail(
+        &mut self,
+        additional: usize,
+        #[cfg(feature = "observe")] cause: crate::MigrationCause
+    ) {
         let vec = unsafe { self.vec.as_mut() };
         let length = self.tail_start + self.tail_len;
 
         // Include the tail when reserving so it survives a reallocation.
         let old_len = vec.len();
         unsafe { vec.set_len(length) }
+        #[cfg(feature = "observe")]
+        let result = vec.try_reserve_with(additional, cause);
+        #[cfg(not(feature = "observe"))]
         let result = vec.try_reserve(additional);
         // Restore the prefix length before a reservation error can panic.
         unsafe { vec.set_len(old_len) };

@@ -146,7 +146,13 @@ impl<T: Clone, const N: usize, A: Allocator + Clone> Clone for IntoIter<T, N, A>
         let mut vec = SmallVec {
             length: LocatedLength::new(0, false),
             raw: RawSmallVec::new(),
-            allocator: self.allocator.clone()
+            allocator: self.allocator.clone(),
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         };
 
         vec.extend(self.as_slice());

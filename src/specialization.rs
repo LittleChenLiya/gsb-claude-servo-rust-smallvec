@@ -80,6 +80,10 @@ where I: core::iter::TrustedLen<Item = T>
         let (_, Some(additional)) = iter.size_hint() else {
             panic!("capacity overflow")
         };
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(additional, crate::MigrationCause::Extend)
+            .unwrap_or_else(crate::SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(additional);
 
         // SAFETY: A `TrustedLen` iterator provides accurate information
@@ -114,6 +118,10 @@ impl<T, const N: usize, const M: usize, A: Allocator> SpecExtend<T, IntoIter<T, 
         let length = slice.len();
         let old_len = self.len();
 
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(length, crate::MigrationCause::Extend)
+            .unwrap_or_else(crate::SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(length);
 
         // SAFETY: Additional memory has been reserved above.
@@ -154,6 +162,10 @@ where T: Copy
         let length = slice.len();
         let old_len = self.len();
 
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(length, crate::MigrationCause::Extend)
+            .unwrap_or_else(crate::SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(length);
 
         // SAFETY: Additional memory has been reserved above.

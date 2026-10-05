@@ -34,6 +34,8 @@ mod macros;
 #[cfg(feature = "malloc_size_of")]
 mod mallocsizeof;
 mod newrange;
+#[cfg(feature = "observe")]
+mod observe;
 mod rawsmallvec;
 mod references;
 #[cfg(feature = "serde")]
@@ -53,6 +55,14 @@ use defmt::{
     write as dewrite
 };
 pub use errors::SmallVecError;
+#[cfg(feature = "observe")]
+pub use observe::{
+    ContainerId,
+    MigrationCause,
+    MigrationEvent,
+    MigrationKind,
+    MigrationObserver
+};
 #[cfg(feature = "std")]
 use std::io;
 use {
@@ -100,7 +110,25 @@ use {
 pub struct SmallVec<T, const N: usize, A: Allocator = Global> {
     length: LocatedLength<T>,
     raw: RawSmallVec<T, N>,
-    allocator: A
+    allocator: A,
+    /// Storage migration observer.
+    ///
+    /// Held in an [`UnsafeCell`] so that the reentrancy guard can be checked
+    /// through the container address carried by the event without ever
+    /// creating a live `&mut` across the callback. This makes a reentrant
+    /// callback a clean panic instead of aliasing UB.
+    #[cfg(feature = "observe")]
+    observer: core::cell::UnsafeCell<Option<observe::ObserverSlot>>,
+    /// Stable identity for this container. Assigned when the first observer
+    /// is installed; `0` means "no identity yet" (and no observer).
+    #[cfg(feature = "observe")]
+    container_id: u64,
+    /// Reentrancy guard. Set for the duration of the observer callback so
+    /// that a reentrant call can be detected and panicked. Accessed only
+    /// through raw pointers in [`emit`](SmallVec::emit) so the reentrant path
+    /// never creates a reference that could alias the callback's borrow.
+    #[cfg(feature = "observe")]
+    in_progress: bool
 }
 
 unsafe impl<T: Send, const N: usize, A: Allocator + Send> Send for SmallVec<T, N, A> {}
@@ -153,7 +181,13 @@ impl<T, const N: usize> SmallVec<T, N, Global> {
         Self {
             length: LocatedLength::new(S, false),
             raw: RawSmallVec::new_inline(buf),
-            allocator: Global
+            allocator: Global,
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         }
     }
 
@@ -164,7 +198,13 @@ impl<T, const N: usize> SmallVec<T, N, Global> {
         let mut vec = Self {
             length: LocatedLength::new(length, false),
             raw: RawSmallVec::new_inline(MaybeUninit::new(buf)),
-            allocator: Global
+            allocator: Global,
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         };
         // Deallocate the remaining elements so no memory is leaked.
         unsafe {
@@ -215,7 +255,13 @@ impl<T, const N: usize> SmallVec<T, N, Global> {
         Self {
             length: LocatedLength::new(length, false),
             raw: RawSmallVec::new_inline(buf),
-            allocator: Global
+            allocator: Global,
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         }
     }
 
@@ -241,7 +287,13 @@ impl<T, const N: usize> SmallVec<T, N, Global> {
             Self {
                 length: LocatedLength::new(length, false),
                 raw: RawSmallVec::new(),
-                allocator: Global
+                allocator: Global,
+                #[cfg(feature = "observe")]
+                observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
             }
         } else {
             let mut vec = ManuallyDrop::new(vec);
@@ -260,7 +312,13 @@ impl<T, const N: usize> SmallVec<T, N, Global> {
             Self {
                 length: LocatedLength::new(length, true),
                 raw: RawSmallVec::new_heap(ptr, cap),
-                allocator: Global
+                allocator: Global,
+                #[cfg(feature = "observe")]
+                observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
             }
         }
     }
@@ -354,7 +412,13 @@ impl<T, const N: usize> SmallVec<T, N, Global> {
         SmallVec {
             length: LocatedLength::new(length, true),
             raw: RawSmallVec::new_heap(ptr, capacity),
-            allocator: Global
+            allocator: Global,
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         }
     }
 }
@@ -573,6 +637,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
     pub fn push_mut(&mut self, value: T) -> &mut T {
         let length = self.len();
         if length == self.capacity() {
+            #[cfg(feature = "observe")]
+            self.try_reserve_with(1, MigrationCause::Push)
+                .unwrap_or_else(SmallVecError::handle);
+            #[cfg(not(feature = "observe"))]
             self.reserve(1);
         }
         debug_assert!(length < self.capacity());
@@ -634,6 +702,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         let other_len = other.len();
         let total_len = length + other_len;
         if total_len > self.capacity() {
+            #[cfg(feature = "observe")]
+            self.try_reserve_with(other_len, MigrationCause::Append)
+                .unwrap_or_else(SmallVecError::handle);
+            #[cfg(not(feature = "observe"))]
             self.reserve(other_len);
         }
 
@@ -653,6 +725,20 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
     }
 
     pub fn try_grow(&mut self, new_capacity: usize) -> Result<(), SmallVecError> {
+        self.try_grow_with(
+            new_capacity,
+            #[cfg(feature = "observe")]
+            MigrationCause::Grow
+        )
+    }
+
+    /// Core grow implementation. `cause` is the operation that triggered it
+    /// and is only used for the migration observer.
+    pub(crate) fn try_grow_with(
+        &mut self,
+        new_capacity: usize,
+        #[cfg(feature = "observe")] cause: MigrationCause
+    ) -> Result<(), SmallVecError> {
         if Self::IS_ZST {
             return Ok(());
         }
@@ -663,6 +749,8 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         }
 
         if new_capacity > Self::inline_size() {
+            #[cfg(feature = "observe")]
+            let old_capacity = self.capacity();
             // SAFETY: we checked all the preconditions
             let result = unsafe {
                 self.raw
@@ -673,14 +761,28 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                 // SAFETY: the allocation succeeded, so self.raw.heap is now
                 // active
                 self.length.set_location::<true>();
+                #[cfg(feature = "observe")]
+                SmallVec::<T, N, A>::emit(self as *mut Self, MigrationEvent {
+                    kind: if on_heap {
+                        MigrationKind::Realloc
+                    } else {
+                        MigrationKind::Spill
+                    },
+                    cause,
+                    old_capacity,
+                    new_capacity,
+                    // Filled in by `emit`.
+                    container: ContainerId(0)
+                });
             }
             result
         } else {
             // new_capacity <= Self::inline_size()
             if on_heap {
+                let old_capacity = unsafe { self.raw.heap.1 };
                 unsafe {
                     // SAFETY: heap member is active
-                    let (ptr, old_cap) = self.raw.heap;
+                    let (ptr, _old_cap) = self.raw.heap;
                     // inline member is now active
 
                     // SAFETY: length <= new_capacity <= Self::inline_size()
@@ -688,12 +790,20 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                     copy_nonoverlapping(ptr.as_ptr(), self.raw.as_mut_ptr_inline(), length);
                     drop(DropDealloc {
                         ptr: ptr.cast(),
-                        size_bytes: old_cap * size_of::<T>(),
+                        size_bytes: old_capacity * size_of::<T>(),
                         align: align_of::<T>(),
                         allocator: &self.allocator
                     });
                     self.length.set_location::<false>();
                 }
+                #[cfg(feature = "observe")]
+                SmallVec::<T, N, A>::emit(self as *mut Self, MigrationEvent {
+                    kind: MigrationKind::ReturnToInline,
+                    cause,
+                    old_capacity,
+                    new_capacity: Self::inline_size(),
+                    container: ContainerId(0)
+                });
             }
             Ok(())
         }
@@ -707,6 +817,20 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
 
     #[inline]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), SmallVecError> {
+        self.try_reserve_with(
+            additional,
+            #[cfg(feature = "observe")]
+            MigrationCause::Reserve
+        )
+    }
+
+    /// Core reserve implementation. `cause` is the operation that triggered
+    /// it and is only used for the migration observer.
+    pub(crate) fn try_reserve_with(
+        &mut self,
+        additional: usize,
+        #[cfg(feature = "observe")] cause: MigrationCause
+    ) -> Result<(), SmallVecError> {
         if additional > self.capacity() - self.len() {
             let required = self
                 .len()
@@ -720,7 +844,11 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                 .checked_next_power_of_two()
                 .ok_or(SmallVecError::CapacityOverflow)?;
 
-            self.try_grow(new_capacity)
+            self.try_grow_with(
+                new_capacity,
+                #[cfg(feature = "observe")]
+                cause
+            )
         } else {
             Ok(())
         }
@@ -739,7 +867,11 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                 .len()
                 .checked_add(additional)
                 .ok_or(SmallVecError::CapacityOverflow)?;
-            self.try_grow(new_capacity)
+            self.try_grow_with(
+                new_capacity,
+                #[cfg(feature = "observe")]
+                MigrationCause::Reserve
+            )
         } else {
             Ok(())
         }
@@ -761,8 +893,18 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                     ptr.cast(),
                     Layout::from_size_align_unchecked(capacity * size_of::<T>(), align_of::<T>())
                 );
+                #[cfg(feature = "observe")]
+                SmallVec::<T, N, A>::emit(self as *mut Self, MigrationEvent {
+                    kind: MigrationKind::ReturnToInline,
+                    cause: MigrationCause::Shrink,
+                    old_capacity: capacity,
+                    new_capacity: Self::inline_size(),
+                    container: ContainerId(0)
+                });
             }
         } else if length < self.capacity() {
+            #[cfg(feature = "observe")]
+            let old_capacity = unsafe { self.raw.heap.1 };
             // SAFETY: length > Self::inline_size() >= 0
             // so new capacity is non zero, it is equal to the length
             // T can't be a ZST because SmallVec<ZST, N, Global> is never
@@ -772,6 +914,14 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                     .try_grow_raw(self.length, length, &self.allocator)
                     .unwrap_or_else(SmallVecError::handle)
             };
+            #[cfg(feature = "observe")]
+            SmallVec::<T, N, A>::emit(self as *mut Self, MigrationEvent {
+                kind: MigrationKind::Realloc,
+                cause: MigrationCause::Shrink,
+                old_capacity,
+                new_capacity: length,
+                container: ContainerId(0)
+            });
         }
     }
 
@@ -788,16 +938,24 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
             if target <= Self::inline_size() {
                 // SAFETY: on_heap is true, so we're on the heap
                 unsafe {
-                    let (ptr, capacity) = self.raw.heap;
+                    let (ptr, old_capacity) = self.raw.heap;
                     copy_nonoverlapping(ptr.as_ptr(), self.raw.as_mut_ptr_inline(), length);
                     self.length.set_location::<false>();
                     self.allocator.deallocate(
                         ptr.cast(),
                         Layout::from_size_align_unchecked(
-                            capacity * size_of::<T>(),
+                            old_capacity * size_of::<T>(),
                             align_of::<T>()
                         )
                     );
+                    #[cfg(feature = "observe")]
+                    SmallVec::<T, N, A>::emit(self as *mut Self, MigrationEvent {
+                        kind: MigrationKind::ReturnToInline,
+                        cause: MigrationCause::Shrink,
+                        old_capacity: capacity,
+                        new_capacity: Self::inline_size(),
+                        container: ContainerId(0)
+                    });
                 }
             } else if target < capacity {
                 // SAFETY: length > Self::inline_size() >= 0
@@ -809,6 +967,14 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                         .try_grow_raw(self.length, target, &self.allocator)
                         .unwrap_or_else(SmallVecError::handle)
                 };
+                #[cfg(feature = "observe")]
+                SmallVec::<T, N, A>::emit(self as *mut Self, MigrationEvent {
+                    kind: MigrationKind::Realloc,
+                    cause: MigrationCause::Shrink,
+                    old_capacity: capacity,
+                    new_capacity: target,
+                    container: ContainerId(0)
+                });
             }
         }
     }
@@ -915,6 +1081,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         if index > length {
             assert_failed(index, length);
         }
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(1, MigrationCause::Insert)
+            .unwrap_or_else(SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(1);
         debug_assert!(length < self.capacity());
 
@@ -1270,6 +1440,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         let source = other.as_ptr();
 
         let l = self.len();
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(length, MigrationCause::Extend)
+            .unwrap_or_else(SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(length);
 
         // SAFETY: Additional memory has been reserved,
@@ -1292,6 +1466,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
             end
         } = source;
         let length = end - start;
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(length, MigrationCause::Extend)
+            .unwrap_or_else(SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(length);
 
         // SAFETY: The call to `reserve` ensures that the capacity is large
@@ -1310,6 +1488,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         let l = self.len();
         let length = other.len();
         assert!(index <= l);
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(length, MigrationCause::Extend)
+            .unwrap_or_else(SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(length);
         unsafe {
             let base_ptr = self.as_mut_ptr();
@@ -1330,7 +1512,13 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
         Self {
             length: LocatedLength::new(0, false),
             raw: RawSmallVec::new(),
-            allocator
+            allocator,
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         }
     }
 
@@ -1354,6 +1542,150 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
     }
 }
 
+/// Storage migration observer API.
+///
+/// Available only with the `observe` cargo feature. Attaching an observer to
+/// a container does not change its layout or behavior; it only causes
+/// [`MigrationEvent`]s to be emitted when the container's storage actually
+/// migrates.
+///
+/// # Reentrancy
+///
+/// The observer callback receives the event by reference and has no safe way
+/// to reach back into the container — the container is mid-operation when
+/// the callback runs. A deliberate reentry through the container address
+/// carried by the event (see [`MigrationEvent::container`]) is detected and
+/// panics rather than aliasing the container's internals.
+#[cfg(feature = "observe")]
+impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
+    /// Installs the migration observer, replacing any previous one.
+    ///
+    /// The observer is attached to this container only. Cloning the container
+    /// propagates the observer only if [`MigrationObserver::clone_observer`]
+    /// returns one.
+    pub fn set_observer<O: MigrationObserver>(&mut self, observer: O) {
+        if self.container_id == 0 {
+            self.container_id = next_container_id();
+        }
+        self.observer = core::cell::UnsafeCell::new(Some(observe::ObserverSlot {
+            callback: Box::new(observer)
+        }));
+    }
+
+    /// Like [`set_observer`](Self::set_observer), but takes an already boxed
+    /// observer. Used by [`Clone`] to propagate observers that provide a
+    /// [`clone_observer`](MigrationObserver::clone_observer).
+    pub(crate) fn set_observer_boxed(&mut self, callback: Box<dyn MigrationObserver>) {
+        if self.container_id == 0 {
+            self.container_id = next_container_id();
+        }
+        self.observer = core::cell::UnsafeCell::new(Some(observe::ObserverSlot {
+            callback
+        }));
+    }
+
+    /// Returns the stable identity of this container, if an observer has been
+    /// installed.
+    pub fn container_id(&self) -> Option<ContainerId> {
+        if self.container_id == 0 {
+            None
+        } else {
+            Some(ContainerId(self.container_id))
+        }
+    }
+
+    /// Removes the current observer and returns it.
+    pub fn take_observer(&mut self) -> Option<Box<dyn MigrationObserver>> {
+        // SAFETY: `self.observer` is only accessed through `&mut self` here,
+        // so no other access can be in flight.
+        unsafe { (*self.observer.get()).take() }.map(|slot| slot.callback)
+    }
+
+    /// Removes the current observer.
+    pub fn clear_observer(&mut self) {
+        self.observer = core::cell::UnsafeCell::new(None);
+    }
+
+    /// Returns `true` if this container has an observer installed.
+    pub fn has_observer(&self) -> bool {
+        // SAFETY: reading the `Option` discriminant does not touch the
+        // callback; the only requirement is that no `&mut` is live, which is
+        // guaranteed by `&self`.
+        unsafe { (*self.observer.get()).is_some() }
+    }
+
+    /// Returns a reference to the observer slot, if any.
+    pub(crate) fn observer_slot(&self) -> Option<&observe::ObserverSlot> {
+        // SAFETY: the returned reference is tied to `&self`, so it cannot
+        // outlive the container or be used to mutate it.
+        unsafe { (*self.observer.get()).as_ref() }
+    }
+
+    /// Emits a migration event to the installed observer.
+    ///
+    /// This is a no-op when no observer is installed. The event's container
+    /// identity is always set to `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called reentrantly for the same container (i.e. from within
+    /// a callback already running for it).
+    pub(crate) fn emit(this: *mut Self, mut event: MigrationEvent) {
+        // SAFETY: `this` is a valid pointer to a `SmallVec` for the duration
+        // of the call. Every access below goes through a raw pointer, so the
+        // reentrant path never creates a reference that could alias the
+        // callback's `&mut`.
+        unsafe {
+            let container_id = (*this).container_id;
+            event.container = ContainerId(container_id);
+
+            // Reentrancy guard: a field on the container, accessed through a
+            // raw pointer so the reentrant path creates no reference.
+            if (*this).in_progress {
+                panic!(
+                    "reentrant storage migration observer call for the same `SmallVec`"
+                );
+            }
+
+            let opt: *mut Option<observe::ObserverSlot> =
+                &raw mut (*this).observer as *mut Option<observe::ObserverSlot>;
+            if (*opt).is_none() {
+                return;
+            }
+            let slot: *mut observe::ObserverSlot =
+                &mut *(*opt).as_mut().unwrap_unchecked();
+
+            // Set the guard before invoking the callback so a reentrant call
+            // is detected. The Drop guard clears it on every exit path.
+            (*this).in_progress = true;
+            struct Guard<T, const N: usize, A: Allocator>(*mut SmallVec<T, N, A>);
+            impl<T, const N: usize, A: Allocator> Drop for Guard<T, N, A> {
+                fn drop(&mut self) {
+                    // SAFETY: see the function-level safety note; the pointer
+                    // is valid for the duration of the outer call.
+                    unsafe {
+                        (*self.0).in_progress = false;
+                    }
+                }
+            }
+            let _guard = Guard(this);
+
+            (*slot).callback.on_migration(&event);
+        }
+    }
+}
+
+/// Returns a fresh, globally unique container identity.
+#[cfg(feature = "observe")]
+pub(crate) fn next_container_id() -> u64 {
+    use core::sync::atomic::{
+        AtomicU64,
+        Ordering
+    };
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 impl<T: Clone, const N: usize, A: Allocator> SmallVec<T, N, A> {
     #[inline]
     pub fn resize(&mut self, length: usize, value: T) {
@@ -1373,6 +1705,10 @@ impl<T: Clone, const N: usize, A: Allocator> SmallVec<T, N, A> {
     pub fn extend_from_within<R>(&mut self, source: R)
     where R: core::ops::RangeBounds<usize> {
         let source = core::ops::Range::new(source, self.len());
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(source.len(), MigrationCause::Extend)
+            .unwrap_or_else(SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(source.len());
 
         // SAFETY: The call to `reserve` ensures that the capacity is large
@@ -1621,6 +1957,10 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
             let length = self.len();
             if length == self.capacity() {
                 let (lower, _) = iterator.size_hint();
+                #[cfg(feature = "observe")]
+                self.try_reserve_with(lower.saturating_add(1), MigrationCause::Extend)
+                    .unwrap_or_else(SmallVecError::handle);
+                #[cfg(not(feature = "observe"))]
                 self.reserve(lower.saturating_add(1));
             }
             unsafe {
@@ -1629,6 +1969,27 @@ impl<T, const N: usize, A: Allocator> SmallVec<T, N, A> {
                 // bump the length after each step.
                 // NB can't overflow since we would have had to alloc the
                 // address space
+                self.length.add(1);
+            }
+        }
+    }
+
+    /// Like [`extend_fallback`](Self::extend_fallback), but attributes any
+    /// migration to `cause`. Used by [`Clone`] to attribute migrations to the
+    /// new container.
+    #[cfg(feature = "observe")]
+    pub(crate) fn extend_with_cause<I>(&mut self, iter: I, cause: MigrationCause)
+    where I: IntoIterator<Item = T> {
+        let mut iterator = iter.into_iter();
+        while let Some(element) = iterator.next() {
+            let length = self.len();
+            if length == self.capacity() {
+                let (lower, _) = iterator.size_hint();
+                self.try_reserve_with(lower.saturating_add(1), cause)
+                    .unwrap_or_else(SmallVecError::handle);
+            }
+            unsafe {
+                core::ptr::write(self.as_mut_ptr().add(length), element);
                 self.length.add(1);
             }
         }
@@ -1699,10 +2060,33 @@ impl<T: Clone, const N: usize, A: Allocator + Clone> Clone for SmallVec<T, N, A>
         let mut vec = SmallVec {
             length: LocatedLength::new(0, false),
             raw: RawSmallVec::new(),
-            allocator: self.allocator.clone()
+            allocator: self.allocator.clone(),
+            #[cfg(feature = "observe")]
+            observer: core::cell::UnsafeCell::new(None),
+            #[cfg(feature = "observe")]
+            container_id: 0,
+            #[cfg(feature = "observe")]
+            in_progress: false
         };
 
-        vec.extend(self);
+        #[cfg(feature = "observe")]
+        {
+            // Propagate a clone of the observer before extending, so any
+            // migration during construction is recorded against the new
+            // container (its identity), never against `self`.
+            if let Some(slot) = self.observer_slot() {
+                if let Some(callback) = slot.callback.clone_observer() {
+                    vec.set_observer_boxed(callback);
+                }
+            }
+
+            vec.extend_with_cause(self.iter().cloned(), MigrationCause::Clone);
+        }
+
+        #[cfg(not(feature = "observe"))]
+        {
+            vec.extend(self);
+        }
 
         vec
     }
@@ -1859,6 +2243,10 @@ unsafe impl<const N: usize> BufMut for SmallVec<u8, N, Global> {
     #[inline]
     fn chunk_mut(&mut self) -> &mut UninitSlice {
         if self.capacity() == self.len() {
+            #[cfg(feature = "observe")]
+            self.try_reserve_with(64, MigrationCause::Reserve)
+                .unwrap_or_else(SmallVecError::handle);
+            #[cfg(not(feature = "observe"))]
             self.reserve(64); // Grow the smallvec
         }
 
@@ -1878,6 +2266,10 @@ unsafe impl<const N: usize> BufMut for SmallVec<u8, N, Global> {
     fn put<T: bytes::Buf>(&mut self, mut source: T)
     where Self: Sized {
         // In case the source isn't contiguous, reserve upfront.
+        #[cfg(feature = "observe")]
+        self.try_reserve_with(source.remaining(), MigrationCause::Reserve)
+            .unwrap_or_else(SmallVecError::handle);
+        #[cfg(not(feature = "observe"))]
         self.reserve(source.remaining());
 
         while source.has_remaining() {

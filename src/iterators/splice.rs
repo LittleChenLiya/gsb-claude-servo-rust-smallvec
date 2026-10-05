@@ -74,7 +74,11 @@ impl<I: Iterator, const N: usize> Drop for Splice<'_, I, N> {
             // FIXME: Is the upper bound a better guess? Or something else?
             let (lower_bound, _upper_bound) = self.replace_with.size_hint();
             if lower_bound > 0 {
-                self.drain.move_tail(lower_bound);
+                self.drain.move_tail(
+                    lower_bound,
+                    #[cfg(feature = "observe")]
+                    crate::MigrationCause::Splice
+                );
                 if !self.drain.fill(&mut self.replace_with) {
                     return;
                 }
@@ -88,7 +92,11 @@ impl<I: Iterator, const N: usize> Drop for Splice<'_, I, N> {
                 .into_iter();
             // Now we have an exact count.
             if collected.len() > 0 {
-                self.drain.move_tail(collected.len());
+                self.drain.move_tail(
+                    collected.len(),
+                    #[cfg(feature = "observe")]
+                    crate::MigrationCause::Splice
+                );
                 let filled = self.drain.fill(&mut collected);
                 debug_assert!(filled);
                 debug_assert_eq!(collected.len(), 0);

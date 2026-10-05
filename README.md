@@ -55,6 +55,7 @@ v.sort();
 - `encase`: implements encasing as a runtime-sized array
 - `internals`: exports through the public API `LocatedLength` and `RawSmallVec`
 - `malloc_size_of`: implements `MallocSizeOf` and `MallocShallowSizeOf`
+- `observe`: adds a storage migration observer (`MigrationEvent`, `MigrationKind`, `MigrationCause`); see below
 - `rayon`: implements parallel iteration
 - `serde`: implements serde's serialization and deserialization
 - `specialization` (nightly): enables specialization, improving performance on some cases
@@ -64,3 +65,41 @@ v.sort();
 > - SmallVec without any features enabled does not make use of the standard library.
 > - The `rayon` feature implicitly requires `std`.
 > - The `allocator-api2` feature requires `allocator-api`
+
+## Storage migration observer
+
+The optional `observe` feature adds an opt-in observer that records the
+*actual* storage migrations a `SmallVec` undergoes: inline → heap spills,
+heap reallocations, and heap → inline returns. Every event reports the
+capacity before and after the migration, the container-level operation that
+triggered it, and a stable identity of the container that migrated. Events
+never carry element values.
+
+```rust
+use smallvec::{MigrationKind, SmallVec};
+
+let mut v: SmallVec<i32, 2> = SmallVec::new();
+v.set_observer(|event| {
+    // event.kind, event.cause, event.old_capacity, event.new_capacity, ...
+});
+
+v.push(1);
+v.push(2);
+v.push(3); // one spill: capacity 2 -> 4
+```
+
+When the `observe` feature is disabled, the observer API and its cost are
+entirely absent.
+
+### Targeted cargo commands
+
+```sh
+# Run the observer tests:
+cargo test --features observe --test observe
+
+# Run the migration demo:
+cargo run --example migration_demo --features observe
+
+# Check the observer-enabled build:
+cargo check --features observe
+```
