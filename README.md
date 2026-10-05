@@ -55,6 +55,15 @@ v.sort();
 - `encase`: implements encasing as a runtime-sized array
 - `internals`: exports through the public API `LocatedLength` and `RawSmallVec`
 - `malloc_size_of`: implements `MallocSizeOf` and `MallocShallowSizeOf`
+- `migration-observer`: adds `smallvec::observer::ObservedSmallVec`, an opt-in
+  wrapper that reports the container's *actual* storage migrations
+  (inline→heap spills, heap reallocations, and returns to inline storage)
+  with capacities before/after, the triggering operation, and a per-instance
+  container identity. Element values are never recorded, re-entrant callbacks
+  are rejected, and `SmallVec` itself keeps its original API and cost when
+  the feature is disabled. Try it:
+  `cargo test --test migration --features migration-observer` and
+  `cargo run --example migration_demo --features migration-observer`
 - `rayon`: implements parallel iteration
 - `serde`: implements serde's serialization and deserialization
 - `specialization` (nightly): enables specialization, improving performance on some cases

@@ -34,6 +34,9 @@ mod macros;
 #[cfg(feature = "malloc_size_of")]
 mod mallocsizeof;
 mod newrange;
+#[cfg(feature = "migration-observer")]
+#[cfg_attr(docsrs, doc(cfg(feature = "migration-observer")))]
+pub mod observer;
 mod rawsmallvec;
 mod references;
 #[cfg(feature = "serde")]

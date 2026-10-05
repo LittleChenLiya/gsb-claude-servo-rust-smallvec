@@ -32,6 +32,7 @@ strip = false
 allocator-api = []
 allocator-api2 = ["dep:allocator-api2", "allocator-api"]
 internals = []
+migration-observer = []
 rayon = ["std", "dep:rayon"]
 serde = ["dep:serde_core"]
 specialization = []
@@ -74,8 +75,16 @@ name = "rayon"
 required-features = ["rayon"]
 
 [[test]]
+name = "migration"
+required-features = ["migration-observer"]
+
+[[test]]
 name = "serde"
 required-features = ["serde"]
+
+[[example]]
+name = "migration_demo"
+required-features = ["migration-observer"]
 
 [[test]]
 name = "std"
